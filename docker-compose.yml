@@ -12,9 +12,10 @@ services:
     restart: unless-stopped
 
   n8n:
-    image: n8nio/n8n:1.64.0
+    image: n8nio/n8n:latest
     environment:
       - TZ=${TZ}
+      - N8N_SECURE_COOKIE=false
       # (Plus tard, avec domaine/HTTPS)
       # - N8N_EDITOR_BASE_URL=https://<domain>
       # - WEBHOOK_URL=https://<domain>
