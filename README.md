@@ -2,7 +2,6 @@
 
 ## One-off
 1. docker context create mypi --docker "host=ssh://mayyzze@<PI_IP>"
-2. cp .env.sample .env  # ajuster TZ si besoin
 
 ## Deploy
 - make deploy
