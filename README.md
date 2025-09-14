@@ -4,7 +4,9 @@
 1. docker context create mypi --docker "host=ssh://mayyzze@<PI_IP>"
 
 ## Deploy
-- make deploy
+- make deploy (unix)
+- deploy.ps1 (windows) 
+    - ./deploy.ps1 -Context mypi2  # pour un autre contexte
 - ouvrir http://<PI_IP>/
 
 ## Logs
