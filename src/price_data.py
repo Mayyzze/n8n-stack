@@ -1,24 +1,47 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import pytz, json
-from portfolio import PORTFOLIO_DICT
+import pytz, json, os, hashlib, pickle, time
+from portfolio import PORTFOLIO_DICT, START_DATE, ASSET_TYPES
 
 # Load tickers from Yahoo Finance API
-def load_tickers(tickers:list, interval:str = '1h', period:str = '1y'):
-    data = yf.download(tickers, interval = interval, period =period, auto_adjust=True, progress=False, threads=True)
-    #print(data.tail(20))
+def load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_duration:int = 3600):
+    """
+    Charge les données Yahoo Finance pour les tickers, avec cache local (pickle).
+    """
+    cache_dir = "cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_key = hashlib.md5((str(tickers) + interval + period).encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, f"{cache_key}.pkl")
+    cache_time_path = os.path.join(cache_dir, f"{cache_key}.time")
+
+    # Vérifie si le cache existe et est encore valide
+    if os.path.exists(cache_path) and os.path.exists(cache_time_path):
+        with open(cache_time_path, "r") as f:
+            cache_time = float(f.read())
+        if time.time() - cache_time < cache_duration:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+
+    # Sinon, télécharge et met à jour le cache
+    data = yf.download(tickers, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
+    with open(cache_path, "wb") as f:
+        pickle.dump(data, f)
+    with open(cache_time_path, "w") as f:
+        f.write(str(time.time()))
+
     return data
 
 def get_last_price(data, ticker, precision:int = 1):
     i = -1
-    while np.isnan(data['Close', ticker].iloc[i]): # Take the last true data (NaN during weekends)
-        i += -1
-    price = data[('Close', ticker)].iloc[i].round(precision)
+    close_series = data['Close', ticker]
+    while abs(i) <= len(close_series) and np.isnan(close_series.iloc[i]):
+        i -= 1
+    if abs(i) > len(close_series):
+        raise ValueError(f"No valid price found for ticker {ticker}")
+    price = close_series.iloc[i].round(precision)
     date = data.index[i]
     utc_timezone = pytz.timezone('UTC')
-
-    # Convert the UTC datetime to Paris time 
     paris_timezone = pytz.timezone('Europe/Paris')
     date_paris_timezone = date.replace(tzinfo=utc_timezone).astimezone(paris_timezone).strftime('%Y-%m-%d : %Hh%Mm%Ss')
     return date_paris_timezone, price
@@ -68,12 +91,10 @@ def get_asset_section(data, ticker, precision=2, conversion_rate=1.0):
     _, last_price = get_last_price(data, ticker, precision)
     change_1d = get_price_evolution(data, ticker, '1d', precision)
     change_1mo = get_price_evolution(data, ticker, '1mo', precision)
-    change_1y = get_price_evolution(data, ticker, '1y', precision)
     return {
         "last_price": round(last_price * conversion_rate, precision),
         "change_1d_percent": change_1d,
         "change_1mo_percent": change_1mo,
-        "change_1y_percent": change_1y
     }
 
 def get_portfolio_value_eur(data, portfolio:dict):
@@ -110,53 +131,117 @@ def get_portfolio_value_eur(data, portfolio:dict):
         "breakdown": asset_values
     }
 
-def get_portfolio_performance(data, portfolio:dict):
+def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
     """
-    Calcule la performance du portefeuille sur 1 jour, 1 mois et 1 an en pourcentage.
-    Retourne un dict avec les performances.
+    Retourne la performance depuis start_date et le rendement annualisé pour chaque type d'actif.
+    Résultat formaté en JSON pour utilisation backend.
     """
     _, eurusd_price = get_last_price(data, 'EURUSD=X', precision=4)
-    periods = {'1d': 2, '1mo': 2, '1y': 2}
-    performance = {}
+    drilldown = {}
 
-    for period, precision in periods.items():
-        total_now = 0
-        total_past = 0
-        for ticker, quantity in portfolio.items():
-            # Récupère le prix actuel et le prix à la période donnée
-            if ticker == 'DBX9.DE':
-                _, price_now_eur = get_last_price(data, ticker, precision)
-                _, price_past_eur = get_price_at_given_time(data, ticker, period, precision)
-                price_now_usd = price_now_eur * eurusd_price
-                price_past_usd = price_past_eur * eurusd_price
-                value_now_eur = price_now_usd * quantity / eurusd_price
-                value_past_eur = price_past_usd * quantity / eurusd_price
-            elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
-                _, price_now_usd = get_last_price(data, ticker, precision)
-                _, price_past_usd = get_price_at_given_time(data, ticker, period, precision)
-                value_now_eur = price_now_usd * quantity / eurusd_price
-                value_past_eur = price_past_usd * quantity / eurusd_price
-            elif ticker == 'EURUSD=X':
-                _, price_now = get_last_price(data, ticker, precision)
-                _, price_past = get_price_at_given_time(data, ticker, period, precision)
-                value_now_eur = price_now * quantity
-                value_past_eur = price_past * quantity
-            else:
-                raise ValueError(f"Unsupported ticker for performance calculation: {ticker}")
+    start_timestamp = pd.Timestamp(start_date)
+    # Pour chaque type d'actif, on cumule les valeurs
+    type_values_now = {}
+    type_values_start = {}
 
-            total_now += value_now_eur
-            total_past += value_past_eur
-
-        if total_past != 0:
-            perf = round((total_now - total_past) / total_past * 100, precision)
+    for ticker, quantity in portfolio.items():
+        asset_type = ASSET_TYPES.get(ticker, 'other')
+        # Prix actuel
+        if ticker == 'DBX9.DE':
+            _, price_now_eur = get_last_price(data, ticker, precision=2)
+            price_now_usd = price_now_eur * eurusd_price
+            value_now_eur = price_now_usd * quantity / eurusd_price
+        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
+            _, price_now_usd = get_last_price(data, ticker, precision=2)
+            value_now_eur = price_now_usd * quantity / eurusd_price
+        elif ticker == 'EURUSD=X':
+            _, price_now = get_last_price(data, ticker, precision=4)
+            value_now_eur = price_now * quantity
         else:
-            perf = None
-        performance[period] = perf
+            _, price_now = get_last_price(data, ticker, precision=2)
+            value_now_eur = price_now * quantity
+
+        # Prix à la date d'achat
+        idx = data.index.get_indexer([start_timestamp], method='nearest')[0]
+        if ticker == 'DBX9.DE':
+            price_start_eur = data['Close', ticker].iloc[idx]
+            if np.isnan(price_start_eur):
+                continue
+            price_start_usd = price_start_eur * eurusd_price
+            value_start_eur = price_start_usd * quantity / eurusd_price
+        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
+            price_start_usd = data['Close', ticker].iloc[idx]
+            if np.isnan(price_start_usd):
+                continue
+            value_start_eur = price_start_usd * quantity / eurusd_price
+        elif ticker == 'EURUSD=X':
+            price_start = data['Close', ticker].iloc[idx]
+            if np.isnan(price_start):
+                continue
+            value_start_eur = price_start * quantity
+
+
+        # Cumule par type d'actif
+        type_values_now[asset_type] = type_values_now.get(asset_type, 0) + value_now_eur
+        type_values_start[asset_type] = type_values_start.get(asset_type, 0) + value_start_eur
+
+    # Calcul des performances par type d'actif
+    for asset_type in type_values_now:
+        value_now = type_values_now[asset_type]
+        value_start = type_values_start.get(asset_type, 0)
+        if value_start > 0:
+            perf_total = round((value_now - value_start) / value_start * 100, 2)
+            days = (data.index[-1] - start_timestamp).days
+            if days > 0:
+                annualized_return = round(((value_now / value_start) ** (365 / days) - 1) * 100, 2)
+            else:
+                annualized_return = None
+        else:
+            perf_total = None
+            annualized_return = None
+
+        drilldown[asset_type] = {
+            "performance_since_start_percent": perf_total,
+            "annualized_return_percent": annualized_return
+        }
+
+    return drilldown
+
+def get_portfolio_allocation_by_type(data, portfolio:dict):
+    """
+    Retourne la répartition du portefeuille par type de classe d'actifs (en EUR).
+    """
+    _, eurusd_price = get_last_price(data, 'EURUSD=X', precision=4)
+    allocation = {}
+    total_value_eur = 0
+
+    for ticker, quantity in portfolio.items():
+        asset_type = ASSET_TYPES.get(ticker, 'other')
+        # Calcul de la valeur en EUR
+        if ticker == 'DBX9.DE':
+            _, last_price_eur = get_last_price(data, ticker, precision=2)
+            last_price_usd = last_price_eur * eurusd_price
+            value_eur = last_price_usd * quantity / eurusd_price
+        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
+            _, last_price_usd = get_last_price(data, ticker, precision=2)
+            value_eur = last_price_usd * quantity / eurusd_price
+        elif ticker == 'EURUSD=X':
+            _, last_price = get_last_price(data, ticker, precision=4)
+            value_eur = last_price * quantity
+        else:
+            _, last_price = get_last_price(data, ticker, precision=2)
+            value_eur = last_price * quantity
+
+        allocation[asset_type] = allocation.get(asset_type, 0) + value_eur
+        total_value_eur += value_eur
+
+    # Formatage pour affichage en pourcentage
+    allocation_percent = {k: round(v / total_value_eur * 100, 2) for k, v in allocation.items()}
 
     return {
-        "performance_1d_percent": performance['1d'],
-        "performance_1mo_percent": performance['1mo'],
-        "performance_1y_percent": performance['1y']
+        "allocation_eur": {k: round(v, 2) for k, v in allocation.items()},
+        "allocation_percent": allocation_percent,
+        "total_value_eur": round(total_value_eur, 2)
     }
 
 if __name__ == "__main__":
@@ -172,8 +257,12 @@ if __name__ == "__main__":
         "ChinaA_USD": get_asset_section(data, 'DBX9.DE', precision=2, conversion_rate=eurusd_price),
         "EmergingMarkets_USD": get_asset_section(data, 'CEMA.L', precision=2)
     }
-    print(json.dumps(output, indent=2))
     # portfolio_value = get_portfolio_value_eur(data, PORTFOLIO_DICT)
     # print(json.dumps(portfolio_value, indent=2))
-    portfolio_performance = get_portfolio_performance(data, PORTFOLIO_DICT)
-    print(json.dumps(portfolio_performance, indent=2))
+    result = {
+    "assets": output,
+    "performance_by_type": get_portfolio_performance_drilldown(data, PORTFOLIO_DICT, start_date=START_DATE),
+    "allocation_percent": get_portfolio_allocation_by_type(data, PORTFOLIO_DICT)["allocation_percent"]
+    }
+    print(json.dumps(result, indent=2))
+
