@@ -5,27 +5,41 @@ services:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /opt/traefik/letsencrypt:/letsencrypt
     restart: unless-stopped
 
   n8n:
-    image: n8nio/n8n:latest
+    build:
+      context: .                # build depuis ton répertoire projet
+      dockerfile: Dockerfile 
+    image: n8n-python:latest
     environment:
       - TZ=${TZ}
-      - N8N_SECURE_COOKIE=false
-      # (Plus tard, avec domaine/HTTPS)
-      # - N8N_EDITOR_BASE_URL=https://<domain>
-      # - WEBHOOK_URL=https://<domain>
+      - N8N_SECURE_COOKIE=true
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_EDITOR_BASE_URL=https://${DUCKDNS_DOMAIN}
+      - WEBHOOK_URL=https://${DUCKDNS_DOMAIN}/
+      - N8N_HOST=${DUCKDNS_DOMAIN}
+      - N8N_PROTOCOL=https      
     volumes:
       - n8n_data:/home/node/.n8n
     restart: unless-stopped
     labels:
       - traefik.enable=true
-      - traefik.http.routers.n8n.rule=PathPrefix(`/`)
-      - traefik.http.routers.n8n.entrypoints=web
+      - traefik.http.routers.n8n.rule=Host(`mayyzze.duckdns.org`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls.certresolver=le
       - traefik.http.services.n8n.loadbalancer.server.port=5678
 
 volumes:
