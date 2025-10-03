@@ -163,17 +163,17 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
 
         # Prix à la date d'achat
         idx = data.index.get_indexer([start_timestamp], method='nearest')[0]
+        eurusd_price_start = data['Close', 'EURUSD=X'].iloc[idx]
         if ticker == 'DBX9.DE':
             price_start_eur = data['Close', ticker].iloc[idx]
             if np.isnan(price_start_eur):
                 continue
-            price_start_usd = price_start_eur * eurusd_price
-            value_start_eur = price_start_usd * quantity / eurusd_price
+            value_start_eur = price_start_eur * quantity
         elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
             price_start_usd = data['Close', ticker].iloc[idx]
             if np.isnan(price_start_usd):
                 continue
-            value_start_eur = price_start_usd * quantity / eurusd_price
+            value_start_eur = price_start_usd * quantity / eurusd_price_start
         elif ticker == 'EURUSD=X':
             price_start = data['Close', ticker].iloc[idx]
             if np.isnan(price_start):
