@@ -248,7 +248,7 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
         annualized_return_portfolio = None
 
     output = drilldown
-    output.update({"Total": {
+    output.update({"Global": {
         "performance_since_start_percent": perf_total_portfolio,
         "annualized_return_percent": annualized_return_portfolio
     }})
