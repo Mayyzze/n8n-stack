@@ -247,16 +247,12 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
         perf_total_portfolio = None
         annualized_return_portfolio = None
 
-    return {
-        "total": {
-            "total_value_now_eur": round(total_now, 2),
-            "total_value_start_eur": round(total_start, 2),
-            "performance_since_start_percent": perf_total_portfolio,
-            "annualized_return_percent": annualized_return_portfolio,
-            "skipped_tickers": sorted(set(skipped_tickers))
-        },
-        "by_type": drilldown
-    }
+    output = drilldown
+    output.update({"Total": {
+        "performance_since_start_percent": perf_total_portfolio,
+        "annualized_return_percent": annualized_return_portfolio
+    }})
+    return output
 
 def get_portfolio_allocation_by_type(data, portfolio:dict):
     """
