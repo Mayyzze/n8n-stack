@@ -72,22 +72,24 @@ def _get_valid_price_at_idx(data, ticker, idx):
     """
     series = data['Close', ticker]
     n = len(series)
-    if n == 0 or idx < -n or idx >= n:
+    if n == 0:
         return None
-
-    # normalize negative idx to positive
+    # normaliser idx négatif en index positif
     if idx < 0:
         idx = n + idx
-
-    if not np.isnan(series.iloc[idx]):
-        return series.iloc[idx]
-
-    for offset in range(1, max(idx + 1, n - idx)):
-        for cand in (idx - offset, idx + offset):
-            if 0 <= cand < n:
-                val = series.iloc[cand]
-                if not np.isnan(val):
-                    return val
+    # clamp dans les bornes
+    if idx < 0:
+        idx = 0
+    if idx >= n:
+        idx = n - 1
+    # recherche en amont : idx, idx-1, idx-2, ...
+    for cand in range(idx, -1, -1):
+        try:
+            val = series.iloc[cand]
+        except Exception:
+            continue
+        if not np.isnan(val):
+            return val
     return None
 
 def _get_price_at_given_time(data, ticker, time, precision:int = 1):
