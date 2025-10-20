@@ -65,37 +65,61 @@ def _get_last_price(data, ticker, precision:int = 1):
     date_paris_timezone = date.replace(tzinfo=utc_timezone).astimezone(paris_timezone).strftime('%Y-%m-%d : %Hh%Mm%Ss')
     return date_paris_timezone, price
 
+def _get_valid_price_at_idx(data, ticker, idx):
+    """
+    Retourne le prix 'Close' le plus proche non-NaN autour de idx, ou None si introuvable.
+    Recherche symétrique : idx, idx-1, idx+1, idx-2, idx+2, ...
+    """
+    series = data['Close', ticker]
+    n = len(series)
+    if n == 0 or idx < -n or idx >= n:
+        return None
+
+    # normalize negative idx to positive
+    if idx < 0:
+        idx = n + idx
+
+    if not np.isnan(series.iloc[idx]):
+        return series.iloc[idx]
+
+    for offset in range(1, max(idx + 1, n - idx)):
+        for cand in (idx - offset, idx + offset):
+            if 0 <= cand < n:
+                val = series.iloc[cand]
+                if not np.isnan(val):
+                    return val
+    return None
 
 def _get_price_at_given_time(data, ticker, time, precision:int = 1):
     """
-    Get the price of the ticker at a given time. Time value supported : '1d', '1mo', '1y', '5d' , '7d' , '3mo'
+    Get the price of the ticker at a given time window ('1d','1mo','1y','5d','7d','3mo').
+    Retourne (date_paris_tz, price) et lève ValueError si impossible.
     """
-    utc_timezone = pytz.timezone('UTC')
+    delta_days_map = {'1d': 1, '1mo': 30, '1y': 365, '5d': 5, '7d': 7, '3mo': 90}
+    if time not in delta_days_map:
+        raise ValueError("Unsupported time value")
 
-    dict = {'1d' : 1, '1mo' : 30, '1y' : 365, '5d' : 5, '7d' : 7, '3mo' : 90}
-    i = -1
-    while np.isnan(data['Close', ticker].iloc[i]): # Take the last true data (NaN during weekends)
-        i += -1
-    lastQuote = data.index[i]
-    outputQuote = lastQuote - pd.Timedelta(days = dict[time])
-    
-    #Check if the given time is a valid one
-    if outputQuote < data.index[0]:
-        print("Invalid time")
-        exit(1)
-    
-    i = 1
-    while (data.index[-i] > outputQuote) or np.isnan(data['Close', ticker].iloc[-i]):
-        i += 1
-    price = data[('Close', ticker)].iloc[-i].round(precision)
-    date = data.index[-i]
-    utc_timezone = pytz.timezone('UTC')
+    # dernière date d'index (pas forcément last_valid_index mais suffisante pour la window)
+    last_date = pd.Timestamp(data.index[-1])
+    output_date = last_date - pd.Timedelta(days=delta_days_map[time])
 
-    # Convert the UTC datetime to Paris time 
-    paris_timezone = pytz.timezone('Europe/Paris')
-    date_paris_timezone = date.replace(tzinfo=utc_timezone).astimezone(paris_timezone).strftime('%Y-%m-%d : %Hh%Mm%Ss')
+    if output_date < data.index[0]:
+        raise ValueError("Requested time is before available data range")
 
-    return date_paris_timezone, price
+    # trouver l'index le plus proche de output_date
+    idx = data.index.get_indexer([output_date], method='nearest')[0]
+
+    price = _get_valid_price_at_idx(data, ticker, idx)
+    if price is None or np.isnan(price):
+        raise ValueError(f"No valid price around {output_date} for {ticker}")
+
+    date = data.index[idx]
+    try:
+        date_paris_timezone = pd.Timestamp(date).tz_localize('UTC').tz_convert('Europe/Paris').strftime('%Y-%m-%d : %Hh%Mm%Ss')
+    except Exception:
+        date_paris_timezone = pd.Timestamp(date).strftime('%Y-%m-%d : %Hh%Mm%Ss')
+
+    return date_paris_timezone, round(float(price), precision)
 
 def _get_price_evolution(data, ticker, time, precision:int = 1):
     """
