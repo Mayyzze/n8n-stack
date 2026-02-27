@@ -1,432 +1,265 @@
+import hashlib
+import json
 import logging
-import yfinance as yf
+import os
+import pickle
+import time
+
 import pandas as pd
-import numpy as np
-import pytz, json, os, hashlib, pickle, time
+import yfinance as yf
 from curl_cffi import requests as _curl_requests
-from portfolio import PORTFOLIO_DICT, START_DATE, ASSET_TYPES
+from portfolio import ASSET_TYPES, PORTFOLIO_DICT, START_DATE
 
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
-# Session curl_cffi : imite un navigateur Chrome pour contourner les
-# protections anti-bot de Yahoo Finance et réduire les erreurs de rate limit.
 _YF_SESSION = _curl_requests.Session(impersonate="chrome")
+_PARIS = "Europe/Paris"
+
+# Tickers cotés en USD → conversion EUR requise
+USD_TICKERS: frozenset[str] = frozenset({"BTC-USD", "GC=F", "XDW0L.XC", "HSTE.L", "CEMA.L", "TTE"})
+DELTA_DAYS:  dict[str, int]  = {"1d": 1, "5d": 5, "7d": 7, "1mo": 30, "3mo": 90, "1y": 365}
 
 
-def __load_tickers(tickers: list, interval: str = '1h', period: str = '1y', cache_duration: int = 3600):
-    """
-    Charge les données Yahoo Finance avec cache pickle et session curl_cffi.
-    Lève RuntimeError si tous les retries échouent.
-    """
-    cache_dir = "cache"
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_key = hashlib.md5((str(tickers) + interval + period).encode()).hexdigest()
-    cache_path = os.path.join(cache_dir, f"{cache_key}.pkl")
-    cache_time_path = os.path.join(cache_dir, f"{cache_key}.time")
+# ─── Primitives ───────────────────────────────────────────────────────────────
 
-    if os.path.exists(cache_path) and os.path.exists(cache_time_path):
-        with open(cache_time_path, "r") as f:
-            cache_time = float(f.read())
-        if time.time() - cache_time < cache_duration:
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
+def _load_tickers(tickers: list[str], interval: str = "1d", period: str = "2y", ttl: int = 3600) -> pd.DataFrame:
+    """Télécharge les données Yahoo Finance avec cache pickle + session Chrome."""
+    os.makedirs("cache", exist_ok=True)
+    path = os.path.join("cache", hashlib.md5((str(tickers) + interval + period).encode()).hexdigest() + ".pkl")
 
-    backoff = 1.0
-    last_exception = None
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    last_exc: Exception | None = None
     for attempt in range(1, 4):
         try:
-            logging.info(f"Downloading tickers (attempt {attempt})...")
-            data = yf.download(
-                tickers, interval=interval, period=period,
-                auto_adjust=True, progress=False, threads=False,
-                session=_YF_SESSION,
-            )
-            if data is None or data.empty:
-                raise ValueError("yfinance returned empty data")
-            if ('Close' not in data.columns) and not any(
-                isinstance(c, tuple) and c[0] == 'Close' for c in data.columns
-            ):
-                raise ValueError("Downloaded data does not contain 'Close' column")
-            with open(cache_path, "wb") as f:
-                pickle.dump(data, f)
-            with open(cache_time_path, "w") as f:
-                f.write(str(time.time()))
-            return data
+            logging.info(f"Downloading {len(tickers)} tickers (attempt {attempt})…")
+            df = yf.download(tickers, interval=interval, period=period,
+                             auto_adjust=True, progress=False, threads=False,
+                             session=_YF_SESSION)
+            if df is None or df.empty:
+                raise ValueError("empty dataframe")
+            with open(path, "wb") as f:
+                pickle.dump(df, f)
+            return df
         except Exception as e:
-            last_exception = e
-            logging.warning(f"Download attempt {attempt} failed: {e}")
-            time.sleep(backoff)
-            backoff *= 2
+            last_exc = e
+            logging.warning(f"Attempt {attempt} failed: {e}")
+            time.sleep(2 ** (attempt - 1))
 
-    raise RuntimeError(f"Failed to download tickers after 3 attempts: {last_exception}")
+    raise RuntimeError(f"Download failed after 3 attempts: {last_exc}")
 
-def _get_last_price(data, ticker, precision:int = 1):
-    i = -1
-    close_series = data['Close', ticker]
-    while abs(i) <= len(close_series) and np.isnan(close_series.iloc[i]):
-        i -= 1
-    if abs(i) > len(close_series):
-        raise ValueError(f"No valid price found for ticker {ticker}")
-    price = close_series.iloc[i].round(precision)
-    date = data.index[i]
-    utc_timezone = pytz.timezone('UTC')
-    paris_timezone = pytz.timezone('Europe/Paris')
-    date_paris_timezone = date.replace(tzinfo=utc_timezone).astimezone(paris_timezone).strftime('%Y-%m-%d : %Hh%Mm%Ss')
-    return date_paris_timezone, price
 
-def _get_valid_price_at_idx(data, ticker, idx):
-    """
-    Retourne le prix 'Close' le plus proche non-NaN autour de idx, ou None si introuvable.
-    Recherche symétrique : idx, idx-1, idx+1, idx-2, idx+2, ...
-    """
-    series = data['Close', ticker]
-    n = len(series)
-    if n == 0:
-        return None
-    # normaliser idx négatif en index positif
-    if idx < 0:
-        idx = n + idx
-    # clamp dans les bornes
-    if idx < 0:
-        idx = 0
-    if idx >= n:
-        idx = n - 1
-    # recherche en amont : idx, idx-1, idx-2, ...
-    for cand in range(idx, -1, -1):
-        try:
-            val = series.iloc[cand]
-        except Exception:
-            continue
-        if not np.isnan(val):
-            return val
-    return None
+def _price_at_idx(series: pd.Series, idx: int) -> float | None:
+    """Prix non-NaN le plus récent jusqu'à idx (inclus), ou None si absent."""
+    valid = series.iloc[:idx + 1].dropna()
+    return float(valid.iloc[-1]) if not valid.empty else None
 
-def _get_price_at_given_time(data, ticker, time, precision:int = 1):
-    """
-    Get the price of the ticker at a given time window ('1d','1mo','1y','5d','7d','3mo').
-    Retourne (date_paris_tz, price) et lève ValueError si impossible.
-    """
-    delta_days_map = {'1d': 1, '1mo': 30, '1y': 365, '5d': 5, '7d': 7, '3mo': 90}
-    if time not in delta_days_map:
-        raise ValueError("Unsupported time value")
 
-    # dernière date d'index (pas forcément last_valid_index mais suffisante pour la window)
-    last_date = pd.Timestamp(data.index[-1])
-    output_date = last_date - pd.Timedelta(days=delta_days_map[time])
+def _last_price(data: pd.DataFrame, ticker: str, precision: int = 2) -> tuple[str, float]:
+    """Dernier prix valide d'un ticker avec sa date en heure de Paris."""
+    series = data["Close", ticker].dropna()
+    if series.empty:
+        raise ValueError(f"No valid price for {ticker}")
+    ts = series.index[-1]
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    date_str = ts.tz_convert(_PARIS).strftime("%Y-%m-%d %Hh%M")
+    return date_str, round(float(series.iloc[-1]), precision)
 
-    if output_date < data.index[0]:
-        raise ValueError("Requested time is before available data range")
 
-    # trouver l'index le plus proche de output_date
-    idx = data.index.get_indexer([output_date], method='nearest')[0]
+def _price_at_window(data: pd.DataFrame, ticker: str, window: str, precision: int = 2) -> tuple[str, float]:
+    """Prix à une fenêtre passée : '1d', '5d', '7d', '1mo', '3mo', '1y'."""
+    if window not in DELTA_DAYS:
+        raise ValueError(f"Unsupported window '{window}'")
+    target = data.index[-1] - pd.Timedelta(days=DELTA_DAYS[window])
+    if target < data.index[0]:
+        raise ValueError(f"Window '{window}' predates available data")
+    idx = data.index.get_indexer([target], method="nearest")[0]
+    price = _price_at_idx(data["Close", ticker], idx)
+    if price is None:
+        raise ValueError(f"No valid price for {ticker} near {target.date()}")
+    ts = data.index[idx]
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert(_PARIS).strftime("%Y-%m-%d %Hh%M"), round(price, precision)
 
-    price = _get_valid_price_at_idx(data, ticker, idx)
-    if price is None or np.isnan(price):
-        raise ValueError(f"No valid price around {output_date} for {ticker}")
 
-    date = data.index[idx]
-    try:
-        date_paris_timezone = pd.Timestamp(date).tz_localize('UTC').tz_convert('Europe/Paris').strftime('%Y-%m-%d : %Hh%Mm%Ss')
-    except Exception:
-        date_paris_timezone = pd.Timestamp(date).strftime('%Y-%m-%d : %Hh%Mm%Ss')
+def _evolution(data: pd.DataFrame, ticker: str, window: str, precision: int = 2) -> float:
+    """Variation en % sur une fenêtre donnée."""
+    _, now  = _last_price(data, ticker, precision)
+    _, prev = _price_at_window(data, ticker, window, precision)
+    return round((now - prev) / prev * 100, precision)
 
-    return date_paris_timezone, round(float(price), precision)
 
-def _get_price_evolution(data, ticker, time, precision:int = 1):
-    """
-    Get the evolution of the price of the ticker at a given time. Time value supported : '1d', '1mo', '1y', '5d', '3mo'
-    """
-    _, lastPrice = _get_last_price(data, ticker, precision)
-    _, previousPrice = _get_price_at_given_time(data, ticker, time, precision)
-    rate = round((lastPrice - previousPrice) / previousPrice * 100, precision)
-    return rate
+def _to_eur(price: float, ticker: str, eurusd: float) -> float:
+    """Convertit un prix en EUR si le ticker est coté en USD."""
+    return price / eurusd if ticker in USD_TICKERS else price
 
-def get_asset_section(data, ticker, precision=2, conversion_rate=1.0):
-    _, last_price = _get_last_price(data, ticker, precision)
-    change_1d = _get_price_evolution(data, ticker, '1d', precision)
-    change_1mo = _get_price_evolution(data, ticker, '1mo', precision)
+
+# ─── Sections JSON ────────────────────────────────────────────────────────────
+
+def get_asset_section(data: pd.DataFrame, ticker: str, precision: int = 2, conversion_rate: float = 1.0) -> dict:
+    _, price = _last_price(data, ticker, precision)
     return {
-        "last_price": round(last_price * conversion_rate, precision),
-        "change_1d_percent": change_1d,
-        "change_1mo_percent": change_1mo,
+        "last_price":         round(price * conversion_rate, precision),
+        "change_1d_percent":  _evolution(data, ticker, "1d",  precision),
+        "change_1mo_percent": _evolution(data, ticker, "1mo", precision),
     }
 
-def get_portfolio_value_eur(data, portfolio:dict):
-    """
-    Calcule la valeur totale du portefeuille en EUR et la ventilation par actif.
-    portfolio: dict avec {ticker: quantité}
-    Retourne un dict avec la valeur totale et la ventilation.
-    """
-    _, eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
-    asset_values = {}
-    total_value_eur = 0
 
-    for ticker, quantity in portfolio.items():
-        _, last_price = _get_last_price(data, ticker, precision=2)
-        if ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:  # cotés en USD
-            value_eur = last_price * quantity / eurusd_price
-        else:  # cotés en EUR (DBX9.DE, TTE.PA, etc.)
-            value_eur = last_price * quantity
+def get_portfolio_value_eur(data: pd.DataFrame, portfolio: dict[str, float]) -> dict:
+    """Valeur totale du portefeuille en EUR avec ventilation par actif."""
+    _, eurusd = _last_price(data, "EURUSD=X", 4)
+    breakdown: dict[str, float] = {}
+    total = 0.0
+    for ticker, qty in portfolio.items():
+        _, price = _last_price(data, ticker, 2)
+        val = _to_eur(price, ticker, eurusd) * qty
+        breakdown[ticker] = round(val, 2)
+        total += val
+    return {"total_value_eur": round(total, 2), "breakdown": breakdown}
 
-        asset_values[ticker] = round(value_eur, 2)
-        total_value_eur += value_eur
 
+def get_portfolio_allocation_by_type(data: pd.DataFrame, portfolio: dict[str, float]) -> dict:
+    """Répartition du portefeuille par classe d'actifs en EUR et en %."""
+    _, eurusd = _last_price(data, "EURUSD=X", 4)
+    alloc: dict[str, float] = {}
+    total = 0.0
+    for ticker, qty in portfolio.items():
+        atype = ASSET_TYPES.get(ticker, "other")
+        _, price = _last_price(data, ticker, 2)
+        val = _to_eur(price, ticker, eurusd) * qty
+        alloc[atype] = alloc.get(atype, 0.0) + val
+        total += val
     return {
-        "total_value_eur": round(total_value_eur, 2),
-        "breakdown": asset_values
+        "allocation_eur":     {k: round(v, 2) for k, v in alloc.items()},
+        "allocation_percent": {k: round(v / total * 100, 2) for k, v in alloc.items()},
+        "total_value_eur":    round(total, 2),
     }
 
-def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
-    """
-    Retourne la performance depuis start_date et le rendement annualisé pour chaque type d'actif.
-    Résultat formaté en JSON pour utilisation backend.
-    """
-    _, eurusd_price_now = _get_last_price(data, 'EURUSD=X', precision=4)
-    drilldown = {}
 
-    start_timestamp = pd.Timestamp(start_date)
-    # helper: trouve le prix 'Close' le plus proche non-NaN autour d'un index
-    def _find_nearest_valid_close(ticker, idx):
+def get_portfolio_performance_drilldown(data: pd.DataFrame, portfolio: dict[str, float], start_date: str) -> dict:
+    """Performance par classe d'actifs depuis start_date + retour annualisé."""
+    _, eurusd_now = _last_price(data, "EURUSD=X", 4)
+    start_ts  = pd.Timestamp(start_date)
+    idx_start = data.index.get_indexer([start_ts], method="nearest")[0]
+    eurusd_start = _price_at_idx(data["Close", "EURUSD=X"], idx_start) or eurusd_now
+
+    type_now:   dict[str, float] = {}
+    type_start: dict[str, float] = {}
+
+    for ticker, qty in portfolio.items():
         try:
-            series = data['Close', ticker]
+            _, price_now = _last_price(data, ticker, 2)
+            price_start  = _price_at_idx(data["Close", ticker], idx_start)
         except Exception:
-            return None
-        n = len(series)
-        if idx < 0 or idx >= n:
-            return None
-        # direct
-        v = series.iloc[idx]
-        if not np.isnan(v):
-            return v
-        # recherche symétrique
-        for offset in range(1, max(idx+1, n-idx)):
-            for cand in (idx - offset, idx + offset):
-                if 0 <= cand < n:
-                    val = series.iloc[cand]
-                    if not np.isnan(val):
-                        return val
-        return None    
-    # Pour chaque type d'actif, on cumule les valeurs
-    type_values_now = {}
-    type_values_start = {}
-    total_now = 0.0
-    total_start = 0.0
-    skipped_tickers = []
-
-    # nearest index for start timestamp
-    idx_start = data.index.get_indexer([start_timestamp], method='nearest')[0]
-    for ticker, quantity in portfolio.items():
-        asset_type = ASSET_TYPES.get(ticker, 'other')
-        # valeur actuelle (utilise _get_last_price pour robustesse)
-        _, price_now = _get_last_price(data, ticker, precision=(4 if ticker == 'EURUSD=X' else 2))
-        if np.isnan(price_now):
-            # pas de prix actuel -> ignorer cet actif
-            skipped_tickers.append(ticker)
+            logging.warning(f"Skipping {ticker}: no price data")
+            continue
+        if price_start is None:
+            logging.warning(f"Skipping {ticker}: no data at start date")
             continue
 
-        # conversion to EUR for current value
-        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
-            value_now_eur = price_now * quantity / eurusd_price_now
-        else:  # tickers cotés en EUR
-            value_now_eur = price_now * quantity
+        atype = ASSET_TYPES.get(ticker, "other")
+        type_now[atype]   = type_now.get(atype, 0.0)   + _to_eur(price_now,   ticker, eurusd_now)   * qty
+        type_start[atype] = type_start.get(atype, 0.0) + _to_eur(price_start, ticker, eurusd_start) * qty
 
-        total_now += value_now_eur
-        type_values_now[asset_type] = type_values_now.get(asset_type, 0) + value_now_eur
+    days = max(1, (data.index[-1] - start_ts).days)
 
-        # valeur au start_date : chercher prix non-NaN proche de idx_start
-        price_start = _find_nearest_valid_close(ticker, idx_start)
-        # taux EURUSD au start (utilisé pour convertir USD->EUR pour la valeur de départ)
-        eurusd_price_start = _find_nearest_valid_close('EURUSD=X', idx_start)
-
-        if price_start is None or np.isnan(price_start):
-            skipped_tickers.append(ticker)
-            continue
-
-        # conversion to EUR for start value
-        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
-            if eurusd_price_start is None or np.isnan(eurusd_price_start) or eurusd_price_start == 0:
-                skipped_tickers.append(ticker)
-                continue
-            value_start_eur = price_start * quantity / eurusd_price_start
-        else:
-            value_start_eur = price_start * quantity
-
-        total_start += value_start_eur
-        type_values_start[asset_type] = type_values_start.get(asset_type, 0) + value_start_eur
-
-    # Calcul des performances par type d'actif (existante)
-    for asset_type, value_now in type_values_now.items():
-        value_start = type_values_start.get(asset_type, 0)
-        if value_start > 0:
-            perf_total = round((value_now - value_start) / value_start * 100, 2)
-            days = max(1, (data.index[-1] - start_timestamp).days)
-            annualized_return = round(((value_now / value_start) ** (365 / days) - 1) * 100, 2)
-        else:
-            perf_total = None
-            annualized_return = None
-
-        drilldown[asset_type] = {
-            "performance_since_start_percent": perf_total,
-            "annualized_return_percent": annualized_return
+    def _perf(now: float, start: float) -> dict:
+        if start <= 0:
+            return {"performance_since_start_percent": None, "annualized_return_percent": None}
+        return {
+            "performance_since_start_percent": round((now - start) / start * 100, 2),
+            "annualized_return_percent":       round(((now / start) ** (365 / days) - 1) * 100, 2),
         }
 
-    # Calcul performance totale du portefeuille
-    if total_start > 0:
-        perf_total_portfolio = round((total_now - total_start) / total_start * 100, 2)
-        days_total = max(1, (data.index[-1] - start_timestamp).days)
-        annualized_return_portfolio = round(((total_now / total_start) ** (365 / days_total) - 1) * 100, 2)
-    else:
-        perf_total_portfolio = None
-        annualized_return_portfolio = None
+    result = {atype: _perf(type_now[atype], type_start.get(atype, 0.0)) for atype in type_now}
+    result["Global"] = _perf(sum(type_now.values()), sum(type_start.values()))
+    return result
 
-    output = drilldown
-    output.update({"Global": {
-        "performance_since_start_percent": perf_total_portfolio,
-        "annualized_return_percent": annualized_return_portfolio
-    }})
-    return output
 
-def get_portfolio_allocation_by_type(data, portfolio:dict):
-    """
-    Retourne la répartition du portefeuille par type de classe d'actifs (en EUR).
-    """
-    _, current_eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
-    allocation = {}
-    total_value_eur = 0
-
-    for ticker, quantity in portfolio.items():
-        asset_type = ASSET_TYPES.get(ticker, 'other')
-        # Calcul de la valeur en EUR
-        if ticker == 'DBX9.DE':
-            _, last_price_eur = _get_last_price(data, ticker, precision=2)
-            value_eur = last_price_eur * quantity
-        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
-            _, last_price_usd = _get_last_price(data, ticker, precision=2)
-            value_eur = last_price_usd * quantity / current_eurusd_price
-
-        allocation[asset_type] = allocation.get(asset_type, 0) + value_eur
-        total_value_eur += value_eur
-
-    # Formatage pour affichage en pourcentage
-    allocation_percent = {k: round(v / total_value_eur * 100, 2) for k, v in allocation.items()}
-
-    return {
-        "allocation_eur": {k: round(v, 2) for k, v in allocation.items()},
-        "allocation_percent": allocation_percent,
-        "total_value_eur": round(total_value_eur, 2)
-    }
-
-def get_macro_indicators(data):
-    """
-    Retourne les principaux indicateurs macroéconomiques suivis :
-    - Pétrole WTI (CL=F) et Brent (BZ=F) en USD/baril
-    """
-    macro_assets = {
-        "oil_wti_usd":   "CL=F",
-        "oil_brent_usd": "BZ=F",
-    }
-    indicators = {}
-    for name, ticker in macro_assets.items():
+def get_macro_indicators(data: pd.DataFrame) -> dict:
+    """Prix et évolutions du pétrole WTI (CL=F) et Brent (BZ=F)."""
+    result: dict = {}
+    for name, ticker in {"oil_wti_usd": "CL=F", "oil_brent_usd": "BZ=F"}.items():
         try:
-            _, price = _get_last_price(data, ticker, precision=2)
-            change_1d  = _get_price_evolution(data, ticker, '1d',  2)
-            change_1mo = _get_price_evolution(data, ticker, '1mo', 2)
-            change_1y  = _get_price_evolution(data, ticker, '1y',  2)
-            indicators[name] = {
-                "price_usd":        price,
-                "change_1d_percent":  change_1d,
-                "change_1mo_percent": change_1mo,
-                "change_1y_percent":  change_1y,
+            _, price = _last_price(data, ticker, 2)
+            result[name] = {
+                "price_usd":          price,
+                "change_1d_percent":  _evolution(data, ticker, "1d",  2),
+                "change_1mo_percent": _evolution(data, ticker, "1mo", 2),
+                "change_1y_percent":  _evolution(data, ticker, "1y",  2),
             }
         except Exception as e:
-            logging.warning(f"Could not get macro data for {ticker} ({name}): {e}")
-            indicators[name] = None
-    return indicators
+            logging.warning(f"Macro {name}: {e}")
+            result[name] = None
+    return result
 
 
-def get_market_gold_ratios(data, eurusd_rate: float, inrusd_rate: float):
+def get_market_gold_ratios(data: pd.DataFrame, eurusd: float, inrusd: float) -> dict:
     """
-    Calcule le ratio "marché / or" pour 4 zones géographiques,
-    tous normalisés en USD pour être comparables entre eux.
-
-    Ratio = price_market_usd / price_gold_usd
-    Un ratio croissant signifie que le marché sur-performe l'or.
-
-    Marchés couverts :
-    - US     : ^GSPC  (S&P 500, USD)
-    - Inde   : ^NSEI  (NIFTY 50, INR → converti via INRUSD=X)
-    - Asie EM: CEMA.L (iShares MSCI EM Asia, USD)
-    - Chine A: DBX9.DE (Xtrackers CSI 300, EUR → converti via EURUSD=X)
+    Ratio marché / or pour 4 zones, normalisés en USD.
+    Ratio croissant = le marché sur-performe l'or.
     """
     try:
-        _, gold_now  = _get_last_price(data, 'GC=F', precision=2)
-        _, gold_1d   = _get_price_at_given_time(data, 'GC=F', '1d',  2)
-        _, gold_1mo  = _get_price_at_given_time(data, 'GC=F', '1mo', 2)
-        _, gold_1y   = _get_price_at_given_time(data, 'GC=F', '1y',  2)
+        _, gold_now = _last_price(data, "GC=F", 2)
+        gold_hist = {w: _price_at_window(data, "GC=F", w, 2)[1] for w in ("1d", "1mo", "1y")}
     except Exception as e:
-        logging.warning(f"Cannot retrieve gold price for ratios: {e}")
+        logging.warning(f"Gold unavailable for ratios: {e}")
         return {}
 
-    # (ticker, usd_factor)  — factor converts native price to USD
+    # (ticker, facteur vers USD)
     markets = {
         "us_sp500_gold":    ("^GSPC",   1.0),
-        "india_nifty_gold": ("^NSEI",   inrusd_rate),
+        "india_nifty_gold": ("^NSEI",   inrusd),
         "asia_em_gold":     ("CEMA.L",  1.0),
-        "china_a_gold":     ("DBX9.DE", eurusd_rate),
+        "china_a_gold":     ("DBX9.DE", eurusd),
     }
 
-    ratios = {}
+    result: dict = {}
     for name, (ticker, fx) in markets.items():
         try:
-            _, p_now = _get_last_price(data, ticker, precision=2)
-            _, p_1d  = _get_price_at_given_time(data, ticker, '1d',  2)
-            _, p_1mo = _get_price_at_given_time(data, ticker, '1mo', 2)
-            _, p_1y  = _get_price_at_given_time(data, ticker, '1y',  2)
-
-            ratio_now = round(p_now * fx / gold_now,  4)
-            ratio_1d  = round(p_1d  * fx / gold_1d,  4)
-            ratio_1mo = round(p_1mo * fx / gold_1mo, 4)
-            ratio_1y  = round(p_1y  * fx / gold_1y,  4)
-
-            ratios[name] = {
-                "ratio":              ratio_now,
-                "change_1d_percent":  round((ratio_now - ratio_1d)  / ratio_1d  * 100, 2) if ratio_1d  else None,
-                "change_1mo_percent": round((ratio_now - ratio_1mo) / ratio_1mo * 100, 2) if ratio_1mo else None,
-                "change_1y_percent":  round((ratio_now - ratio_1y)  / ratio_1y  * 100, 2) if ratio_1y  else None,
-            }
+            _, p_now = _last_price(data, ticker, 2)
+            p_hist = {w: _price_at_window(data, ticker, w, 2)[1] for w in ("1d", "1mo", "1y")}
+            r_now = round(p_now * fx / gold_now, 4)
+            result[name] = {"ratio": r_now}
+            for w in ("1d", "1mo", "1y"):
+                r_hist = p_hist[w] * fx / gold_hist[w]
+                result[name][f"change_{w}_percent"] = round((r_now - r_hist) / r_hist * 100, 2)
         except Exception as e:
-            logging.warning(f"Could not compute ratio for {name} ({ticker}): {e}")
-            ratios[name] = None
+            logging.warning(f"Ratio {name}: {e}")
+            result[name] = None
+    return result
 
-    return ratios
 
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ALL_TICKERS = [
-        'BTC-USD', 'EURUSD=X', 'INRUSD=X', 'GC=F',
-        'XDW0L.XC', 'HSTE.L', 'DBX9.DE', 'CEMA.L', 'TTE',
-        'CL=F', 'BZ=F',   # pétrole WTI & Brent
-        '^GSPC', '^NSEI',  # S&P 500, NIFTY 50
+    TICKERS = [
+        "BTC-USD", "EURUSD=X", "INRUSD=X", "GC=F",
+        "XDW0L.XC", "HSTE.L", "DBX9.DE", "CEMA.L", "TTE",
+        "CL=F", "BZ=F",    # pétrole
+        "^GSPC", "^NSEI",  # indices
     ]
-    data = __load_tickers(ALL_TICKERS, interval='1d', period='2y')
-    _, current_eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
-    _, current_inrusd_price = _get_last_price(data, 'INRUSD=X', precision=6)
-    output = {
-        "BTC_USD":             get_asset_section(data, 'BTC-USD',  precision=2),
-        "EUR_USD":             get_asset_section(data, 'EURUSD=X', precision=4),
-        "GOLD_USD":            get_asset_section(data, 'GC=F',     precision=2),
-        "ENERGY_ETF_USD":      get_asset_section(data, 'XDW0L.XC', precision=2),
-        "TOTAL_ENERGIES_EUR":  get_asset_section(data, 'TTE',      precision=2),
-        "HKTech_USD":          get_asset_section(data, 'HSTE.L',   precision=2),
-        "ChinaA_EUR":          get_asset_section(data, 'DBX9.DE',  precision=2),
-        "AsiaEM_USD":          get_asset_section(data, 'CEMA.L',   precision=2),
-    }
-    result = {
-        "assets":              output,
-        "macro_indicators":    get_macro_indicators(data),
-        "market_gold_ratios":  get_market_gold_ratios(data, current_eurusd_price, current_inrusd_price),
-        "performance_by_type": get_portfolio_performance_drilldown(data, PORTFOLIO_DICT, start_date=START_DATE),
-        "allocation_percent":  get_portfolio_allocation_by_type(data, PORTFOLIO_DICT)["allocation_percent"],
-    }
-    print(json.dumps(result, indent=2))
+    data = _load_tickers(TICKERS)
+    _, eurusd = _last_price(data, "EURUSD=X", 4)
+    _, inrusd = _last_price(data, "INRUSD=X", 6)
 
+    print(json.dumps({
+        "assets": {
+            "BTC_USD":            get_asset_section(data, "BTC-USD"),
+            "EUR_USD":            get_asset_section(data, "EURUSD=X", precision=4),
+            "GOLD_USD":           get_asset_section(data, "GC=F"),
+            "ENERGY_ETF_USD":     get_asset_section(data, "XDW0L.XC"),
+            "TOTAL_ENERGIES_EUR": get_asset_section(data, "TTE"),
+            "HKTech_USD":         get_asset_section(data, "HSTE.L"),
+            "ChinaA_EUR":         get_asset_section(data, "DBX9.DE"),
+            "AsiaEM_USD":         get_asset_section(data, "CEMA.L"),
+        },
+        "macro_indicators":    get_macro_indicators(data),
+        "market_gold_ratios":  get_market_gold_ratios(data, eurusd, inrusd),
+        "performance_by_type": get_portfolio_performance_drilldown(data, PORTFOLIO_DICT, START_DATE),
+        "allocation_percent":  get_portfolio_allocation_by_type(data, PORTFOLIO_DICT)["allocation_percent"],
+    }, indent=2))
