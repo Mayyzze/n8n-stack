@@ -316,25 +316,57 @@ def get_portfolio_allocation_by_type(data, portfolio:dict):
         "total_value_eur": round(total_value_eur, 2)
     }
 
-if __name__ == "__main__":
-    data = __load_tickers(['BTC-USD','EURUSD=X', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'DBX9.DE', 'CEMA.L', 'TTE'], interval = '1d', period = '2y')
-    _, current_eurusd_price = _get_last_price(data, 'EURUSD=X', precision = 4)
-    output = {
-        "BTC_USD": get_asset_section(data, 'BTC-USD', precision=2),
-        "EUR_USD": get_asset_section(data, 'EURUSD=X', precision=4),
-        "GOLD_USD": get_asset_section(data, 'GC=F', precision=2),
-        "ENERGY_USD": get_asset_section(data, 'XDW0L.XC', precision=2),
-        "TOTAL_ENERGY_USD": get_asset_section(data, 'TTE', precision=2),
-        "HKTech_USD": get_asset_section(data, 'HSTE.L', precision=2),
-        "ChinaA_USD": get_asset_section(data, 'DBX9.DE', precision=2, conversion_rate=current_eurusd_price),
-        "EmergingMarkets_USD": get_asset_section(data, 'CEMA.L', precision=2)
+def get_macro_indicators(data):
+    """
+    Retourne les principaux indicateurs macroéconomiques suivis :
+    - Pétrole WTI (CL=F) et Brent (BZ=F) en USD/baril
+    """
+    macro_assets = {
+        "oil_wti_usd":   "CL=F",
+        "oil_brent_usd": "BZ=F",
     }
-    # portfolio_value = get_portfolio_value_eur(data, PORTFOLIO_DICT)
-    # print(json.dumps(portfolio_value, indent=2))
+    indicators = {}
+    for name, ticker in macro_assets.items():
+        try:
+            _, price = _get_last_price(data, ticker, precision=2)
+            change_1d  = _get_price_evolution(data, ticker, '1d',  2)
+            change_1mo = _get_price_evolution(data, ticker, '1mo', 2)
+            change_1y  = _get_price_evolution(data, ticker, '1y',  2)
+            indicators[name] = {
+                "price_usd":        price,
+                "change_1d_percent":  change_1d,
+                "change_1mo_percent": change_1mo,
+                "change_1y_percent":  change_1y,
+            }
+        except Exception as e:
+            logging.warning(f"Could not get macro data for {ticker} ({name}): {e}")
+            indicators[name] = None
+    return indicators
+
+
+if __name__ == "__main__":
+    ALL_TICKERS = [
+        'BTC-USD', 'EURUSD=X', 'GC=F',
+        'XDW0L.XC', 'HSTE.L', 'DBX9.DE', 'CEMA.L', 'TTE',
+        'CL=F', 'BZ=F',          # pétrole WTI & Brent
+    ]
+    data = __load_tickers(ALL_TICKERS, interval='1d', period='2y')
+    _, current_eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
+    output = {
+        "BTC_USD":             get_asset_section(data, 'BTC-USD',  precision=2),
+        "EUR_USD":             get_asset_section(data, 'EURUSD=X', precision=4),
+        "GOLD_USD":            get_asset_section(data, 'GC=F',     precision=2),
+        "ENERGY_ETF_USD":      get_asset_section(data, 'XDW0L.XC', precision=2),
+        "TOTAL_ENERGIES_EUR":  get_asset_section(data, 'TTE',      precision=2),
+        "HKTech_USD":          get_asset_section(data, 'HSTE.L',   precision=2),
+        "ChinaA_EUR":          get_asset_section(data, 'DBX9.DE',  precision=2),
+        "AsiaEM_USD":          get_asset_section(data, 'CEMA.L',   precision=2),
+    }
     result = {
-    "assets": output,
-    "performance_by_type": get_portfolio_performance_drilldown(data, PORTFOLIO_DICT, start_date=START_DATE),
-    "allocation_percent": get_portfolio_allocation_by_type(data, PORTFOLIO_DICT)["allocation_percent"]
+        "assets":              output,
+        "macro_indicators":    get_macro_indicators(data),
+        "performance_by_type": get_portfolio_performance_drilldown(data, PORTFOLIO_DICT, start_date=START_DATE),
+        "allocation_percent":  get_portfolio_allocation_by_type(data, PORTFOLIO_DICT)["allocation_percent"],
     }
     print(json.dumps(result, indent=2))
 
