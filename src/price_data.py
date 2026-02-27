@@ -6,16 +6,14 @@ from portfolio import PORTFOLIO_DICT, START_DATE, ASSET_TYPES
 
 # Load tickers from Yahoo Finance API
 def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_duration:int = 3600):
-    """
-    Charge les données Yahoo Finance pour les tickers, avec cache local (pickle).
-    """
+    """Load Yahoo Finance data for tickers, with local pickle cache."""
     cache_dir = "cache"
     os.makedirs(cache_dir, exist_ok=True)
     cache_key = hashlib.md5((str(tickers) + interval + period).encode()).hexdigest()
     cache_path = os.path.join(cache_dir, f"{cache_key}.pkl")
     cache_time_path = os.path.join(cache_dir, f"{cache_key}.time")
 
-    # Vérifie si le cache existe et est encore valide
+    # Check cache validity
     if os.path.exists(cache_path) and os.path.exists(cache_time_path):
         with open(cache_time_path, "r") as f:
             cache_time = float(f.read())
@@ -23,7 +21,7 @@ def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_d
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
 
- # Essaye de télécharger avec retries
+    # Download with retries
     backoff = 1.0
     last_exception = None
     max_retries = 3
@@ -31,7 +29,7 @@ def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_d
         try:
             # logging.info(f"Downloading tickers (attempt {attempt})...")
             data = yf.download(tickers, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
-            # Vérifie que la colonne 'Close' existe et contient quelque chose utile
+            # Validate 'Close' column
             if data is None or data.empty:
                 raise ValueError("yfinance returned empty data")
             # If multiindex, ensure at least one 'Close' column exists
@@ -66,23 +64,20 @@ def _get_last_price(data, ticker, precision:int = 1):
     return date_paris_timezone, price
 
 def _get_valid_price_at_idx(data, ticker, idx):
-    """
-    Retourne le prix 'Close' le plus proche non-NaN autour de idx, ou None si introuvable.
-    Recherche symétrique : idx, idx-1, idx+1, idx-2, idx+2, ...
-    """
+    """Returns nearest non-NaN Close price at or before idx, or None."""
     series = data['Close', ticker]
     n = len(series)
     if n == 0:
         return None
-    # normaliser idx négatif en index positif
+    # normalize negative idx
     if idx < 0:
         idx = n + idx
-    # clamp dans les bornes
+    # clamp to bounds
     if idx < 0:
         idx = 0
     if idx >= n:
         idx = n - 1
-    # recherche en amont : idx, idx-1, idx-2, ...
+    # search backwards from idx
     for cand in range(idx, -1, -1):
         try:
             val = series.iloc[cand]
@@ -93,22 +88,19 @@ def _get_valid_price_at_idx(data, ticker, idx):
     return None
 
 def _get_price_at_given_time(data, ticker, time, precision:int = 1):
-    """
-    Get the price of the ticker at a given time window ('1d','1mo','1y','5d','7d','3mo').
-    Retourne (date_paris_tz, price) et lève ValueError si impossible.
-    """
+    """Returns (date_paris_tz, price) at given time window. Raises ValueError if not found."""
     delta_days_map = {'1d': 1, '1mo': 30, '1y': 365, '5d': 5, '7d': 7, '3mo': 90}
     if time not in delta_days_map:
         raise ValueError("Unsupported time value")
 
-    # dernière date d'index (pas forcément last_valid_index mais suffisante pour la window)
+    # last index date
     last_date = pd.Timestamp(data.index[-1])
     output_date = last_date - pd.Timedelta(days=delta_days_map[time])
 
     if output_date < data.index[0]:
         raise ValueError("Requested time is before available data range")
 
-    # trouver l'index le plus proche de output_date
+    # find nearest index
     idx = data.index.get_indexer([output_date], method='nearest')[0]
 
     price = _get_valid_price_at_idx(data, ticker, idx)
@@ -143,18 +135,14 @@ def get_asset_section(data, ticker, precision=2, conversion_rate=1.0):
     }
 
 def get_portfolio_value_eur(data, portfolio:dict):
-    """
-    Calcule la valeur totale du portefeuille en EUR et la ventilation par actif.
-    portfolio: dict avec {ticker: quantité}
-    Retourne un dict avec la valeur totale et la ventilation.
-    """
+    """Returns total portfolio value in EUR and per-asset breakdown."""
     _, eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
     asset_values = {}
     total_value_eur = 0
 
     for ticker, quantity in portfolio.items():
-        # Conversion USD->EUR si nécessaire
-        if ticker == 'DBX9.DE':  # ChinaA en EUR, convertir en USD puis EUR
+        # USD->EUR conversion
+        if ticker == 'DBX9.DE':  # ChinaA: EUR-priced, convert via USD
             _, last_price_eur = _get_last_price(data, ticker, precision=2)
             last_price_usd = last_price_eur * eurusd_price
             value_eur = last_price_usd * quantity / eurusd_price
@@ -171,15 +159,12 @@ def get_portfolio_value_eur(data, portfolio:dict):
     }
 
 def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
-    """
-    Retourne la performance depuis start_date et le rendement annualisé pour chaque type d'actif.
-    Résultat formaté en JSON pour utilisation backend.
-    """
+    """Returns total and annualized performance since start_date, by asset type."""
     _, eurusd_price_now = _get_last_price(data, 'EURUSD=X', precision=4)
     drilldown = {}
 
     start_timestamp = pd.Timestamp(start_date)
-    # helper: trouve le prix 'Close' le plus proche non-NaN autour d'un index
+    # find nearest valid Close price around idx
     def _find_nearest_valid_close(ticker, idx):
         try:
             series = data['Close', ticker]
@@ -192,7 +177,7 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
         v = series.iloc[idx]
         if not np.isnan(v):
             return v
-        # recherche symétrique
+        # symmetric search
         for offset in range(1, max(idx+1, n-idx)):
             for cand in (idx - offset, idx + offset):
                 if 0 <= cand < n:
@@ -200,7 +185,7 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
                     if not np.isnan(val):
                         return val
         return None    
-    # Pour chaque type d'actif, on cumule les valeurs
+    # accumulate values by asset type
     type_values_now = {}
     type_values_start = {}
     total_now = 0.0
@@ -211,25 +196,25 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
     idx_start = data.index.get_indexer([start_timestamp], method='nearest')[0]
     for ticker, quantity in portfolio.items():
         asset_type = ASSET_TYPES.get(ticker, 'other')
-        # valeur actuelle (utilise _get_last_price pour robustesse)
+        # current value
         _, price_now = _get_last_price(data, ticker, precision=(4 if ticker == 'EURUSD=X' else 2))
         if np.isnan(price_now):
-            # pas de prix actuel -> ignorer cet actif
+            # no current price, skip
             skipped_tickers.append(ticker)
             continue
 
         # conversion to EUR for current value
         elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:
             value_now_eur = price_now * quantity / eurusd_price_now
-        else:  # tickers cotés en EUR
+        else:  # EUR-priced tickers
             value_now_eur = price_now * quantity
 
         total_now += value_now_eur
         type_values_now[asset_type] = type_values_now.get(asset_type, 0) + value_now_eur
 
-        # valeur au start_date : chercher prix non-NaN proche de idx_start
+        # start date value
         price_start = _find_nearest_valid_close(ticker, idx_start)
-        # taux EURUSD au start (utilisé pour convertir USD->EUR pour la valeur de départ)
+        # EURUSD rate at start
         eurusd_price_start = _find_nearest_valid_close('EURUSD=X', idx_start)
 
         if price_start is None or np.isnan(price_start):
@@ -248,7 +233,7 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
         total_start += value_start_eur
         type_values_start[asset_type] = type_values_start.get(asset_type, 0) + value_start_eur
 
-    # Calcul des performances par type d'actif (existante)
+    # performance by asset type
     for asset_type, value_now in type_values_now.items():
         value_start = type_values_start.get(asset_type, 0)
         if value_start > 0:
@@ -264,7 +249,7 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
             "annualized_return_percent": annualized_return
         }
 
-    # Calcul performance totale du portefeuille
+    # total portfolio performance
     if total_start > 0:
         perf_total_portfolio = round((total_now - total_start) / total_start * 100, 2)
         days_total = max(1, (data.index[-1] - start_timestamp).days)
@@ -281,16 +266,14 @@ def get_portfolio_performance_drilldown(data, portfolio:dict, start_date:str):
     return output
 
 def get_portfolio_allocation_by_type(data, portfolio:dict):
-    """
-    Retourne la répartition du portefeuille par type de classe d'actifs (en EUR).
-    """
+    """Returns portfolio allocation by asset type in EUR."""
     _, current_eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
     allocation = {}
     total_value_eur = 0
 
     for ticker, quantity in portfolio.items():
         asset_type = ASSET_TYPES.get(ticker, 'other')
-        # Calcul de la valeur en EUR
+        # compute EUR value
         if ticker == 'DBX9.DE':
             _, last_price_eur = _get_last_price(data, ticker, precision=2)
             value_eur = last_price_eur * quantity
@@ -301,7 +284,7 @@ def get_portfolio_allocation_by_type(data, portfolio:dict):
         allocation[asset_type] = allocation.get(asset_type, 0) + value_eur
         total_value_eur += value_eur
 
-    # Formatage pour affichage en pourcentage
+    # format as percentages
     allocation_percent = {k: round(v / total_value_eur * 100, 2) for k, v in allocation.items()}
 
     return {
