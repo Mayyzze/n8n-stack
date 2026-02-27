@@ -344,14 +344,73 @@ def get_macro_indicators(data):
     return indicators
 
 
+def get_market_gold_ratios(data, eurusd_rate: float, inrusd_rate: float):
+    """
+    Calcule le ratio "marché / or" pour 4 zones géographiques,
+    tous normalisés en USD pour être comparables entre eux.
+
+    Ratio = price_market_usd / price_gold_usd
+    Un ratio croissant signifie que le marché sur-performe l'or.
+
+    Marchés couverts :
+    - US     : ^GSPC  (S&P 500, USD)
+    - Inde   : ^NSEI  (NIFTY 50, INR → converti via INRUSD=X)
+    - Asie EM: CEMA.L (iShares MSCI EM Asia, USD)
+    - Chine A: DBX9.DE (Xtrackers CSI 300, EUR → converti via EURUSD=X)
+    """
+    try:
+        _, gold_now  = _get_last_price(data, 'GC=F', precision=2)
+        _, gold_1d   = _get_price_at_given_time(data, 'GC=F', '1d',  2)
+        _, gold_1mo  = _get_price_at_given_time(data, 'GC=F', '1mo', 2)
+        _, gold_1y   = _get_price_at_given_time(data, 'GC=F', '1y',  2)
+    except Exception as e:
+        logging.warning(f"Cannot retrieve gold price for ratios: {e}")
+        return {}
+
+    # (ticker, usd_factor)  — factor converts native price to USD
+    markets = {
+        "us_sp500_gold":    ("^GSPC",   1.0),
+        "india_nifty_gold": ("^NSEI",   inrusd_rate),
+        "asia_em_gold":     ("CEMA.L",  1.0),
+        "china_a_gold":     ("DBX9.DE", eurusd_rate),
+    }
+
+    ratios = {}
+    for name, (ticker, fx) in markets.items():
+        try:
+            _, p_now = _get_last_price(data, ticker, precision=2)
+            _, p_1d  = _get_price_at_given_time(data, ticker, '1d',  2)
+            _, p_1mo = _get_price_at_given_time(data, ticker, '1mo', 2)
+            _, p_1y  = _get_price_at_given_time(data, ticker, '1y',  2)
+
+            ratio_now = round(p_now * fx / gold_now,  4)
+            ratio_1d  = round(p_1d  * fx / gold_1d,  4)
+            ratio_1mo = round(p_1mo * fx / gold_1mo, 4)
+            ratio_1y  = round(p_1y  * fx / gold_1y,  4)
+
+            ratios[name] = {
+                "ratio":              ratio_now,
+                "change_1d_percent":  round((ratio_now - ratio_1d)  / ratio_1d  * 100, 2) if ratio_1d  else None,
+                "change_1mo_percent": round((ratio_now - ratio_1mo) / ratio_1mo * 100, 2) if ratio_1mo else None,
+                "change_1y_percent":  round((ratio_now - ratio_1y)  / ratio_1y  * 100, 2) if ratio_1y  else None,
+            }
+        except Exception as e:
+            logging.warning(f"Could not compute ratio for {name} ({ticker}): {e}")
+            ratios[name] = None
+
+    return ratios
+
+
 if __name__ == "__main__":
     ALL_TICKERS = [
-        'BTC-USD', 'EURUSD=X', 'GC=F',
+        'BTC-USD', 'EURUSD=X', 'INRUSD=X', 'GC=F',
         'XDW0L.XC', 'HSTE.L', 'DBX9.DE', 'CEMA.L', 'TTE',
-        'CL=F', 'BZ=F',          # pétrole WTI & Brent
+        'CL=F', 'BZ=F',   # pétrole WTI & Brent
+        '^GSPC', '^NSEI',  # S&P 500, NIFTY 50
     ]
     data = __load_tickers(ALL_TICKERS, interval='1d', period='2y')
     _, current_eurusd_price = _get_last_price(data, 'EURUSD=X', precision=4)
+    _, current_inrusd_price = _get_last_price(data, 'INRUSD=X', precision=6)
     output = {
         "BTC_USD":             get_asset_section(data, 'BTC-USD',  precision=2),
         "EUR_USD":             get_asset_section(data, 'EURUSD=X', precision=4),
@@ -365,6 +424,7 @@ if __name__ == "__main__":
     result = {
         "assets":              output,
         "macro_indicators":    get_macro_indicators(data),
+        "market_gold_ratios":  get_market_gold_ratios(data, current_eurusd_price, current_inrusd_price),
         "performance_by_type": get_portfolio_performance_drilldown(data, PORTFOLIO_DICT, start_date=START_DATE),
         "allocation_percent":  get_portfolio_allocation_by_type(data, PORTFOLIO_DICT)["allocation_percent"],
     }
