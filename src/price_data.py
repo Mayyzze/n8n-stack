@@ -153,14 +153,11 @@ def get_portfolio_value_eur(data, portfolio:dict):
     total_value_eur = 0
 
     for ticker, quantity in portfolio.items():
-        # Conversion USD->EUR si nécessaire
-        if ticker == 'DBX9.DE':  # ChinaA en EUR, convertir en USD puis EUR
-            _, last_price_eur = _get_last_price(data, ticker, precision=2)
-            last_price_usd = last_price_eur * eurusd_price
-            value_eur = last_price_usd * quantity / eurusd_price
-        elif ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:  # USD assets
-            _, last_price_usd = _get_last_price(data, ticker, precision=2)
-            value_eur = last_price_usd * quantity / eurusd_price
+        _, last_price = _get_last_price(data, ticker, precision=2)
+        if ticker in ['BTC-USD', 'GC=F', 'XDW0L.XC', 'HSTE.L', 'CEMA.L', 'TTE']:  # cotés en USD
+            value_eur = last_price * quantity / eurusd_price
+        else:  # cotés en EUR (DBX9.DE, TTE.PA, etc.)
+            value_eur = last_price * quantity
 
         asset_values[ticker] = round(value_eur, 2)
         total_value_eur += value_eur
