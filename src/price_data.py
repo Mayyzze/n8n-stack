@@ -1,13 +1,22 @@
+import logging
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz, json, os, hashlib, pickle, time
+from curl_cffi import requests as _curl_requests
 from portfolio import PORTFOLIO_DICT, START_DATE, ASSET_TYPES
 
-# Load tickers from Yahoo Finance API
-def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_duration:int = 3600):
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+
+# Session curl_cffi : imite un navigateur Chrome pour contourner les
+# protections anti-bot de Yahoo Finance et réduire les erreurs de rate limit.
+_YF_SESSION = _curl_requests.Session(impersonate="chrome")
+
+
+def __load_tickers(tickers: list, interval: str = '1h', period: str = '1y', cache_duration: int = 3600):
     """
-    Charge les données Yahoo Finance pour les tickers, avec cache local (pickle).
+    Charge les données Yahoo Finance avec cache pickle et session curl_cffi.
+    Lève RuntimeError si tous les retries échouent.
     """
     cache_dir = "cache"
     os.makedirs(cache_dir, exist_ok=True)
@@ -15,7 +24,6 @@ def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_d
     cache_path = os.path.join(cache_dir, f"{cache_key}.pkl")
     cache_time_path = os.path.join(cache_dir, f"{cache_key}.time")
 
-    # Vérifie si le cache existe et est encore valide
     if os.path.exists(cache_path) and os.path.exists(cache_time_path):
         with open(cache_time_path, "r") as f:
             cache_time = float(f.read())
@@ -23,19 +31,21 @@ def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_d
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
 
- # Essaye de télécharger avec retries
     backoff = 1.0
     last_exception = None
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, 4):
         try:
-            # logging.info(f"Downloading tickers (attempt {attempt})...")
-            data = yf.download(tickers, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
-            # Vérifie que la colonne 'Close' existe et contient quelque chose utile
+            logging.info(f"Downloading tickers (attempt {attempt})...")
+            data = yf.download(
+                tickers, interval=interval, period=period,
+                auto_adjust=True, progress=False, threads=False,
+                session=_YF_SESSION,
+            )
             if data is None or data.empty:
                 raise ValueError("yfinance returned empty data")
-            # If multiindex, ensure at least one 'Close' column exists
-            if ('Close' not in data.columns) and not any(isinstance(c, tuple) and c[0] == 'Close' for c in data.columns):
+            if ('Close' not in data.columns) and not any(
+                isinstance(c, tuple) and c[0] == 'Close' for c in data.columns
+            ):
                 raise ValueError("Downloaded data does not contain 'Close' column")
             with open(cache_path, "wb") as f:
                 pickle.dump(data, f)
@@ -44,12 +54,11 @@ def __load_tickers(tickers:list, interval:str = '1h', period:str = '1y', cache_d
             return data
         except Exception as e:
             last_exception = e
-            # logging.warning(f"Download attempt {attempt} failed: {e}")
+            logging.warning(f"Download attempt {attempt} failed: {e}")
             time.sleep(backoff)
             backoff *= 2
 
-
-    return data
+    raise RuntimeError(f"Failed to download tickers after 3 attempts: {last_exception}")
 
 def _get_last_price(data, ticker, precision:int = 1):
     i = -1
