@@ -3,6 +3,24 @@ Gavekal / Charles Gave macro indicators.
 
 Framework: Four Quadrants (growth vs inflation axes) → regime detection → asset allocation.
 Ref: "The General Theory of Portfolio Construction" - Charles Gave, Gavekal Research.
+
+Axes:
+  X (growth/energy efficiency): S&P 500 / WTI  vs 7-year SMA
+  Y (currency quality/inflation): Gold / 10Y Treasury vs 7-year SMA
+
+Quadrants:
+  Disinflationary Boom  (right + bottom): best regime; buy dips
+  Inflationary Boom     (right + top)   : real assets outperform
+  Deflationary Bust     (left  + bottom): long Treasuries
+  Stagflation           (left  + top)   : worst regime; sell rallies
+
+Wicksellian spread (exact): BAA_real_yield - nominal_GDP_growth
+  < 0        → stimulative / reflationary
+  0-250 bps  → normal credit cycle
+  > 250 bps  → recession imminent (predicted every recession since 1955)
+
+Note: BAA yield and GDP growth are not available via yfinance.
+A market-based proxy is used instead (copper/gold z-score vs normalised 10Y yield).
 """
 
 import json, os, hashlib, pickle, time
@@ -16,10 +34,11 @@ INDICATOR_TICKERS = [
     "CL=F",       # WTI crude (growth / commodity)
     "GC=F",       # Gold (inflation / safe-haven)
     "HG=F",       # Copper (global growth barometer)
-    "TLT",        # 20Y Treasury ETF (deflation hedge)
+    "TLT",        # 20Y Treasury ETF (deflation hedge, kept for reference)
     "^TNX",       # 10Y yield
     "^IRX",       # 13W yield (short-rate proxy)
     "DX-Y.NYB",   # USD index
+    "IEF",        # 7-10Y Treasury ETF (Gold/Treasury inflation ratio)
 ]
 
 MA_YEARS   = 7    # Gave's reference window for regime MAs
@@ -93,17 +112,18 @@ def get_four_quadrants(data: pd.DataFrame) -> dict:
       Deflationary Bust  : long Treasuries, cash         → REDUCE risk
       Stagflation        : gold, real assets, short EQ   → SELL rallies
     """
-    spx    = _series(data, "^GSPC")
-    wti    = _series(data, "CL=F")
-    gold   = _series(data, "GC=F")
-    tlt    = _series(data, "TLT")
+    spx  = _series(data, "^GSPC")
+    wti  = _series(data, "CL=F")
+    gold = _series(data, "GC=F")
+    # IEF = 7-10Y Treasury ETF, best yfinance proxy for "10Y Treasury total return"
+    ief  = _series(data, "IEF")
 
     window = MA_YEARS * 252  # trading-day approximation
 
-    df = pd.DataFrame({"spx": spx, "wti": wti, "gold": gold, "tlt": tlt}).dropna()
+    df = pd.DataFrame({"spx": spx, "wti": wti, "gold": gold, "ief": ief}).dropna()
 
     growth_ratio = (df["spx"] / df["wti"]).rename("growth_ratio")
-    infl_ratio   = (df["gold"] / df["tlt"]).rename("infl_ratio")
+    infl_ratio   = (df["gold"] / df["ief"]).rename("infl_ratio")
 
     gr = _ratio_vs_ma(growth_ratio, window)
     ir = _ratio_vs_ma(infl_ratio,   window)
@@ -111,24 +131,33 @@ def get_four_quadrants(data: pd.DataFrame) -> dict:
     boom         = gr["above_ma"]
     inflationary = ir["above_ma"]
 
-    if     boom and not inflationary: quadrant, signal, assets = "Deflationary Boom",  "BUY dips",       ["equities", "bonds", "tech", "HK_tech", "EM_Asia"]
-    elif   boom and     inflationary: quadrant, signal, assets = "Inflationary Boom",   "HOLD cautiously",["gold", "energy", "commodities", "BTC"]
-    elif not boom and not inflationary: quadrant, signal, assets = "Deflationary Bust","REDUCE risk",    ["long_treasuries", "cash", "defensive"]
-    else:                              quadrant, signal, assets = "Stagflation",        "SELL rallies",   ["gold", "real_assets"]
+    if   boom and not inflationary: quadrant, signal, assets = "Deflationary Boom",  "BUY dips",        ["equities", "bonds", "tech", "HK_tech", "EM_Asia"]
+    elif boom and     inflationary: quadrant, signal, assets = "Inflationary Boom",  "HOLD cautiously", ["gold", "energy", "commodities", "BTC"]
+    elif not boom and inflationary: quadrant, signal, assets = "Stagflation",        "SELL rallies",    ["gold", "real_assets"]
+    else:                           quadrant, signal, assets = "Deflationary Bust",  "REDUCE risk",     ["long_treasuries", "cash", "defensive"]
+
+    # Gave's target allocations per quadrant (equities capped 80%, gold capped 30%)
+    allocation_targets = {
+        "Deflationary Boom":  {"equities": 70, "bonds": 20, "cash":  5, "gold":  5},
+        "Inflationary Boom":  {"equities": 20, "bonds":  5, "cash": 20, "gold": 30},
+        "Stagflation":        {"equities":  0, "bonds":  0, "cash": 70, "gold": 10},
+        "Deflationary Bust":  {"equities": 10, "bonds": 70, "cash": 10, "gold": 10},
+    }
 
     return {
-        "quadrant":          quadrant,
-        "tactical_signal":   signal,
-        "recommended_assets": assets,
+        "quadrant":            quadrant,
+        "tactical_signal":     signal,
+        "recommended_assets":  assets,
+        "allocation_target":   allocation_targets[quadrant],
         "growth": {
-            "ratio":    gr["value"],
-            "ma":       gr["ma"],
-            "signal":   "boom" if boom else "bust",
+            "ratio":  gr["value"],
+            "ma":     gr["ma"],
+            "signal": "boom" if boom else "bust",
         },
         "inflation": {
-            "ratio":    ir["value"],
-            "ma":       ir["ma"],
-            "signal":   "inflationary" if inflationary else "deflationary",
+            "ratio":  ir["value"],
+            "ma":     ir["ma"],
+            "signal": "inflationary" if inflationary else "deflationary",
         },
     }
 
@@ -138,16 +167,22 @@ def get_wicksellian_signal(data: pd.DataFrame) -> dict:
     """
     Wicksellian spread proxy.
 
-    Gave's rule: if market rate < natural rate (real growth) → money too cheap
-    → inflation or asset bubble ahead.
+    Exact formula (Gave): (BAA_real_yield) - nominal_GDP_growth
+      where BAA_real_yield = BAA_yield - 10yr_avg_CPI
 
-    Proxy:
-      - Market rate   : 10Y nominal yield (^TNX)
-      - Growth signal : Copper/Gold ratio normalised to a z-score (rising = growth)
-      - Spread        : copper_gold_zscore - (10Y yield / its 3Y mean)
+    Thresholds:
+      > 250 bps → recession imminent (predicted every recession since 1955)
+      0-250 bps → normal credit cycle
+      < 0       → stimulative / reflationary
 
-    Positive spread → stimulative (Wicksellian warning: inflation / bubble risk).
-    Negative spread → restrictive (deflationary pressure).
+    BAA yield and GDP are not available on yfinance.
+    Proxy used here:
+      market_rate  = 10Y yield normalised to its 3Y mean (↑ = restrictive)
+      growth_proxy = Copper/Gold z-score (↑ = growth accelerating)
+      spread_proxy = growth_proxy - market_rate  (unit: z-score difference)
+
+    Positive proxy → stimulative; negative proxy → restrictive.
+    Approximate 250-bps threshold is flagged when proxy < -1 std.
     """
     tnx    = _series(data, "^TNX")
     copper = _series(data, "HG=F")
@@ -156,26 +191,32 @@ def get_wicksellian_signal(data: pd.DataFrame) -> dict:
     df = pd.DataFrame({"tnx": tnx, "copper": copper, "gold": gold}).dropna()
 
     # Normalised 10Y yield vs its 3-year mean
-    y3  = 3 * 252
-    tnx_ratio = df["tnx"] / df["tnx"].rolling(y3, min_periods=252).mean()
+    tnx_ratio = df["tnx"] / df["tnx"].rolling(3 * 252, min_periods=252).mean()
 
     # Copper/Gold z-score (252-day)
-    cg      = df["copper"] / df["gold"]
-    cg_mean = cg.rolling(252, min_periods=120).mean()
-    cg_std  = cg.rolling(252, min_periods=120).std()
-    cg_z    = (cg - cg_mean) / cg_std.replace(0, np.nan)
+    cg    = df["copper"] / df["gold"]
+    cg_z  = (cg - cg.rolling(252, min_periods=120).mean()) / \
+             cg.rolling(252, min_periods=120).std().replace(0, np.nan)
 
     spread = cg_z - tnx_ratio
 
-    latest_spread = float(spread.iloc[-1])
-    stimulative   = latest_spread > 0
+    val  = float(spread.iloc[-1])
+    # flag if spread in deeply negative territory (proxy for >250bps in real spread)
+    recession_flag = val < float(spread.rolling(252, min_periods=120).mean().iloc[-1]
+                                 - spread.rolling(252, min_periods=120).std().iloc[-1])
+
+    regime = "stimulative" if val > 0 else ("recession_warning" if recession_flag else "restrictive")
 
     return {
-        "wicksellian_spread":  round(latest_spread, 4),
-        "regime":              "stimulative" if stimulative else "restrictive",
-        "signal":              "inflation/bubble risk" if stimulative else "deflationary pressure",
-        "tnx_vs_3y_mean":      round(float(tnx_ratio.iloc[-1]), 4),
-        "copper_gold_zscore":  round(float(cg_z.iloc[-1]), 4),
+        "wicksellian_spread_proxy": round(val, 4),
+        "regime":                   regime,
+        "recession_warning":        recession_flag,
+        "signal":                   "inflation/bubble risk" if val > 0 else
+                                    "RECESSION IMMINENT (>250bps proxy)" if recession_flag else
+                                    "deflationary pressure",
+        "tnx_vs_3y_mean":           round(float(tnx_ratio.iloc[-1]), 4),
+        "copper_gold_zscore":       round(float(cg_z.iloc[-1]), 4),
+        "note":                     "proxy only; exact formula requires BAA yield + GDP growth (FRED)",
     }
 
 
