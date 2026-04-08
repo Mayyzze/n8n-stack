@@ -3,3 +3,4 @@ n8n_data/
 letsencrypt/
 *.log
 .DS_Store
+.claude

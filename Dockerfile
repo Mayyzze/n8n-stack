@@ -14,8 +14,11 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY src/requirements.txt /scripts/requirements.txt
 RUN pip3 install --no-cache-dir -r /scripts/requirements.txt
 
-# Copier ton script
-COPY src/price_data.py /scripts/price_data.py
+# Copier les scripts
+COPY src/fetcher.py /scripts/fetcher.py
+COPY src/prices.py /scripts/prices.py
+COPY src/analytics.py /scripts/analytics.py
+COPY src/main.py /scripts/main.py
 COPY src/portfolio.py /scripts/portfolio.py
 
 # Remettre l'utilisateur node (comme dans l'image officielle n8n)
