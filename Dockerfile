@@ -1,4 +1,4 @@
-FROM n8nio/n8n:latest
+FROM n8nio/n8n:2.3.0
 
 # Passer root pour installer Python
 USER root

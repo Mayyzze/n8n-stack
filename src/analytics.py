@@ -27,8 +27,10 @@ def _ticker_value_eur(data: pd.DataFrame, ticker: str, quantity: float, eurusd: 
 
 def get_asset_section(data: pd.DataFrame, ticker: str, precision: int = 2, conversion_rate: float = 1.0) -> dict:
     _, last_price = get_last_price(data, ticker, precision)
+    _, eurusd = get_last_price(data, 'EURUSD=X', precision=4)
     return {
         "last_price":        round(last_price * conversion_rate, precision),
+        "last_price_eur":    round(_to_eur(last_price * conversion_rate, ticker, eurusd), precision),
         "change_1d_percent":  get_price_evolution(data, ticker, '1d',  precision),
         "change_1mo_percent": get_price_evolution(data, ticker, '1mo', precision),
     }
