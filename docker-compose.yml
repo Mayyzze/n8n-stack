@@ -21,7 +21,7 @@ services:
     build:
       context: .                # build depuis ton répertoire projet
       dockerfile: Dockerfile 
-    image: n8n-python:latest
+    image: n8n-python:1.121.2
     environment:
       - TZ=${TZ}
       - N8N_SECURE_COOKIE=true
