@@ -6,12 +6,15 @@ services:
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
-      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.dnschallenge=true
+      - --certificatesresolvers.le.acme.dnschallenge.provider=duckdns
       - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+    environment:
+      - DUCKDNS_TOKEN=${DUCKDNS_TOKEN}
     ports:
       - "80:80"
-      - "443:443"
+      - "40443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /opt/traefik/letsencrypt:/letsencrypt
@@ -28,10 +31,11 @@ services:
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
       - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-      - N8N_EDITOR_BASE_URL=https://${DUCKDNS_DOMAIN}
-      - WEBHOOK_URL=https://${DUCKDNS_DOMAIN}/
+      - N8N_EDITOR_BASE_URL=https://${DUCKDNS_DOMAIN}:40443
+      - WEBHOOK_URL=https://${DUCKDNS_DOMAIN}:40443/
       - N8N_HOST=${DUCKDNS_DOMAIN}
-      - N8N_PROTOCOL=https      
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
     volumes:
       - n8n_data:/home/node/.n8n
     restart: unless-stopped

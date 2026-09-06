@@ -1,8 +1,14 @@
 import json
-from portfolio import PORTFOLIO_DICT, START_DATE, EVENTS
+
+from analytics import (
+    get_asset_section,
+    get_mwr_by_type,
+    get_portfolio_allocation_by_type,
+    get_portfolio_performance_drilldown,
+)
 from fetcher import load_tickers
+from portfolio import EVENTS, PORTFOLIO_DICT, START_DATE
 from prices import get_last_price
-from analytics import get_asset_section, get_portfolio_performance_drilldown, get_portfolio_allocation_by_type, get_mwr_by_type
 
 if __name__ == "__main__":
     data = load_tickers(
